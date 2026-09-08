@@ -27,6 +27,7 @@ def _install_packages():
 # _install_packages()  # deps preinstalled for local test
 
 import asyncio
+import contextvars
 import json
 import os
 import hashlib
@@ -84,6 +85,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Host detection (پلتفرم‌مستقل) ──────────────────────────────────────────────
+# قبلاً دامنه فقط از RAILWAY_PUBLIC_DOMAIN خونده می‌شد، پس روی Render یا دامنه‌ی
+# اختصاصی (مثل lucity.cloud پشت Cloudflare/هر پروکسی دیگه) به‌جاش "localhost"
+# می‌افتاد. حالا دامنه‌ی واقعی از هدر Host همون درخواستی که داره میاد استخراج
+# می‌شه، پس فرقی نمی‌کنه پنل روی Railway باشه، Render باشه یا هر دامنه‌ی
+# دلخواه دیگه پشتش باشه — همیشه همون دامنه‌ای که کاربر باهاش پنل رو باز کرده
+# توی لینک‌های تولیدشده ست می‌شه.
+_request_host_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "rvg_request_host", default=""
+)
+
+
+def _host_without_port(raw_host: str) -> str:
+    h = raw_host.strip()
+    if not h:
+        return ""
+    if h.startswith("["):  # IPv6 literal, e.g. [::1]:8000
+        return h.split("]")[0].lstrip("[")
+    if h.count(":") == 1:  # host:port
+        return h.split(":", 1)[0]
+    return h
+
+
+@app.middleware("http")
+async def _detect_public_host(request: Request, call_next):
+    # X-Forwarded-Host رو اول چک می‌کنیم چون پشت پروکسی‌هایی مثل Cloudflare یا
+    # هر ری‌ورس‌پروکسی دیگه (مثلاً روی lucity.cloud)، هدر Host ممکنه داخلی
+    # باشه ولی X-Forwarded-Host دامنه‌ی واقعی‌ای هست که کاربر توی مرورگرش می‌بینه.
+    raw_host = (
+        request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+        or request.headers.get("host", "")
+    )
+    host_only = _host_without_port(raw_host)
+    token = _request_host_ctx.set(host_only) if host_only else None
+    try:
+        return await call_next(request)
+    finally:
+        if token is not None:
+            _request_host_ctx.reset(token)
+
 # ── Persistence ───────────────────────────────────────────────────────────────
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DATA_FILE = DATA_DIR / "rvg_state.json"
@@ -113,7 +154,12 @@ def _get_or_create_secret() -> str:
 CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
     "secret": _get_or_create_secret(),
-    "host": os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost"),
+    "host": (
+        os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+        or os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+        or os.environ.get("PUBLIC_DOMAIN")
+        or "localhost"
+    ),
     "disable_logging": False,
 }
 
@@ -494,7 +540,18 @@ async def shutdown():
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_host() -> str:
-    return os.environ.get("RAILWAY_PUBLIC_DOMAIN", CONFIG["host"])
+    # اولویت با دامنه‌ی همون درخواستی هست که داره میاد (هر پلتفرمی، هر دامنه‌ای
+    # باشه). فقط وقتی درخواست HTTP در جریان نیست (مثلاً کارهای پس‌زمینه/بک‌گراند
+    # مثل ad_tag یا سیو) می‌ریم سراغ متغیرهای محیطی به‌عنوان fallback.
+    ctx_host = _request_host_ctx.get()
+    if ctx_host:
+        return ctx_host
+    return (
+        os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+        or os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+        or os.environ.get("PUBLIC_DOMAIN")
+        or CONFIG["host"]
+    )
 
 def generate_uuid() -> str:
     h = secrets.token_hex(16)
